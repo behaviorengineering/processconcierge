@@ -44,10 +44,11 @@ is_manual_event() {
 }
 
 # Only the subject line counts: GitHub passes the full message, and a body that
-# explains the skip marker must not trigger it.
+# explains the skip marker must not trigger it. A manual run ignores the marker:
+# it is how a commit merged with [skip release] gets its chosen bump.
 head_subject="${HEAD_MSG:-}"
 head_subject="${head_subject%%$'\n'*}"
-if [[ "${head_subject}" == *"[skip release]"* ]]; then
+if ! is_manual_event && [[ "${head_subject}" == *"[skip release]"* ]]; then
   write_out "skip=true"
   write_out "reason=commit contains [skip release]"
   exit 0
