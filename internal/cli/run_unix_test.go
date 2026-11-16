@@ -16,25 +16,6 @@ import (
 	"time"
 )
 
-// binary is the processconcierge command, built once for these tests, so each test drives it as its owner would.
-var binary string
-
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "processconcierge-test-")
-	if err != nil {
-		panic(err)
-	}
-	binary = filepath.Join(dir, "processconcierge")
-	build := exec.Command("go", "build", "-o", binary, "../../cmd/processconcierge") //nolint:gosec // G204: builds this module's own command.
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		panic(err)
-	}
-	code := m.Run()
-	_ = os.RemoveAll(dir)
-	os.Exit(code)
-}
-
 func alive(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
@@ -193,20 +174,25 @@ func TestSweepStopsWhatACrashedReaperLeftAndReportsIt(t *testing.T) {
 	waitFor(t, "the left-over grandchild is still running", func() bool { return !alive(grandchild) })
 }
 
-func TestTheGuideVersionAndAnUnknownCommand(t *testing.T) {
-	var out bytes.Buffer
-	if code := Execute(context.Background(), nil, &out, &out, "v1.2.3"); code != ExitOK {
-		t.Fatalf("bare invoke exited %d", code)
+func TestTheReaperStopsTheProgramWhenTheOwnersProcessExits(t *testing.T) {
+	owner := exec.Command("/bin/sleep", "60")
+	if err := owner.Start(); err != nil {
+		t.Fatal(err)
 	}
-	if lines := strings.Count(out.String(), "\n"); lines < 10 || !strings.HasPrefix(out.String(), "processconcierge v1.2.3\n") {
-		t.Fatalf("guide:\n%s", out.String())
+	t.Cleanup(func() { _ = owner.Process.Kill(); _ = owner.Wait() })
+	file := filepath.Join(t.TempDir(), "grandchild")
+	cmd := exec.Command(binary, "run", "--owner-pid", strconv.Itoa(owner.Process.Pid), "--grace", "300ms", "--", //nolint:gosec // G204: the command these tests built.
+		"/bin/sh", "-c", "sleep 60 & echo $! > "+file+"; wait")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
-	out.Reset()
-	if code := Execute(context.Background(), []string{"version"}, &out, &out, "v1.2.3"); code != ExitOK || out.String() != "processconcierge v1.2.3\n" {
-		t.Fatalf("version exited %d: %q", code, out.String())
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	grandchild := readPid(t, file)
+
+	_ = owner.Process.Kill()
+	_ = owner.Wait()
+	if code := exitCode(t, cmd); code != 128+int(syscall.SIGTERM) {
+		t.Fatalf("exit code %d", code)
 	}
-	out.Reset()
-	if code := Execute(context.Background(), []string{"nope"}, &out, &out, "v1.2.3"); code != ExitUsage {
-		t.Fatalf("an unknown command exited %d", code)
-	}
+	waitFor(t, "the grandchild outlived its owner", func() bool { return !alive(grandchild) })
 }

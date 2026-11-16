@@ -1,8 +1,10 @@
 // Package reaper runs one child the way tini does in a container, for a parent that cannot supervise processes
 // itself, such as a Node or Electron backend. The child gets the reaper's own stdin, stdout and stderr, untouched,
 // and runs in a unit of its own. The reaper stops that whole unit when the child exits (clearing anything it left
-// running), when the reaper is asked to stop, or when its owner goes away: the owner holds the other end of a pipe
-// the reaper reads, and every way the owner can die, a crash or a SIGKILL included, closes it.
+// running), when the reaper is asked to stop, or when its owner goes away. The reaper notices its owner going in one
+// of two ways: the owner holds the other end of a pipe the reaper reads, which every way the owner can die closes,
+// or the reaper waits on the owner's process id, which is how a Node owner on Windows is watched, since Node hands
+// extra pipes to a child in a way Go does not read.
 package reaper
 
 import (
@@ -33,8 +35,10 @@ type Config struct {
 	Args []string
 	// Grace is the time between the gentle signal and the hard stop. Zero uses proc.DefaultGrace.
 	Grace time.Duration
-	// Owner is the pipe the owner holds open, or nil to watch no owner.
+	// Owner is the pipe the owner holds open, or nil to watch no pipe.
 	Owner io.Reader
+	// OwnerPID is the owner's process id, watched until it exits, or zero to watch no process.
+	OwnerPID int
 	// Registry is the folder the child is recorded in while it runs, so a later sweep can find it; empty records
 	// nothing.
 	Registry string
@@ -102,20 +106,26 @@ func (c Config) Run(ctx context.Context) (int, error) {
 
 // awaitReason blocks until the child exits, a stop request arrives, or the owner goes away, and says which.
 func (c Config) awaitReason(child *proc.Process) string {
-	ownerGone := make(chan struct{})
+	pipeClosed := make(chan struct{})
 	if c.Owner != nil {
 		go func() {
 			// Nothing is ever written; the read ends when the owner's end closes.
 			_, _ = io.Copy(io.Discard, c.Owner)
-			close(ownerGone)
+			close(pipeClosed)
 		}()
+	}
+	var ownerExited <-chan struct{}
+	if c.OwnerPID > 0 {
+		ownerExited = watchPID(c.OwnerPID)
 	}
 	select {
 	case <-child.Done():
 		return "the child exited"
 	case sig := <-c.Signals:
 		return "the reaper got " + sig.String()
-	case <-ownerGone:
-		return "the owner went away"
+	case <-pipeClosed:
+		return "the owner's pipe closed"
+	case <-ownerExited:
+		return "the owner's process exited"
 	}
 }

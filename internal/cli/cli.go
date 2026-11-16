@@ -74,7 +74,7 @@ func newRoot(stdout io.Writer, version string, code *int) *cobra.Command {
 }
 
 func newRun(code *int) *cobra.Command {
-	var ownerFD int
+	var ownerFD, ownerPID int
 	var grace time.Duration
 	var registry, logFile string
 	cmd := &cobra.Command{
@@ -84,7 +84,9 @@ func newRun(code *int) *cobra.Command {
 			"program exits, when this command gets SIGTERM, SIGINT or SIGHUP, or when the owner's pipe closes, it sends\n" +
 			"the group SIGTERM, waits the grace period, then kills whatever is left, and exits with the program's code\n" +
 			"(128 plus the signal's number when a signal ended it). Pass the owner's pipe as an inherited file descriptor\n" +
-			"with --owner-fd; the owner never writes to it, and every way the owner can die closes it.",
+			"with --owner-fd; the owner never writes to it, and every way the owner can die closes it. Where the owner\n" +
+			"cannot pass a pipe, as Node on Windows cannot, pass its process id with --owner-pid instead. On Windows the\n" +
+			"program runs in a Job Object that ends with the reaper, however the reaper ends.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logger, closeLog, err := openLog(logFile)
@@ -107,6 +109,7 @@ func newRun(code *int) *cobra.Command {
 			if ownerFD >= 0 {
 				cfg.Owner = reaper.OwnerPipe(ownerFD)
 			}
+			cfg.OwnerPID = ownerPID
 			exit, err := cfg.Run(cmd.Context())
 			*code = exit
 			return err
@@ -114,6 +117,7 @@ func newRun(code *int) *cobra.Command {
 	}
 	cmd.Flags().SetInterspersed(false)
 	cmd.Flags().IntVar(&ownerFD, "owner-fd", -1, "inherited file descriptor of the owner's pipe; the program is stopped when it closes")
+	cmd.Flags().IntVar(&ownerPID, "owner-pid", 0, "the owner's process id; the program is stopped when it exits (use on Windows, where Node cannot pass --owner-fd)")
 	cmd.Flags().DurationVar(&grace, "grace", proc.DefaultGrace, "time between SIGTERM and the hard stop")
 	cmd.Flags().StringVar(&registry, "registry", "", "folder to record the program in while it runs, for a later sweep")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "file to append what the reaper does to; by default nothing is logged")
