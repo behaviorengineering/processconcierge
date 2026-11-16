@@ -28,6 +28,13 @@ const (
 	CodeRegistry Code = "registry"
 	// CodeSlot means a slot could not be taken or released, or none came free in time.
 	CodeSlot Code = "slot"
+	// CodePressure means the platform's memory pressure signal could not be read.
+	CodePressure Code = "pressure"
+	// CodeStuck means a child did not exit after the hard stop: it is stuck inside a kernel call, with the kill
+	// pending, and will die when that call returns.
+	CodeStuck Code = "stuck"
+	// CodeStoppedBeforeStart means a stop request arrived before the child was started, so it never was.
+	CodeStoppedBeforeStart Code = "stopped-before-start"
 )
 
 // Error is a failure with a stable code.

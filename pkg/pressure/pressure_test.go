@@ -17,21 +17,21 @@ func TestLevelFromPSI(t *testing.T) {
 		{"some avg10=40.00 avg60=3.00 avg300=1.00 total=5\nfull avg10=15.00 avg60=0.00 avg300=0.00 total=1\n", Critical},
 	}
 	for _, c := range cases {
-		got, detail, ok := LevelFromPSI(c.text)
+		got, detail, ok := levelFromPSI(c.text)
 		if !ok || got != c.want || detail == "" {
-			t.Errorf("LevelFromPSI(%q) = %v, %q, %v; want %v", c.text, got, detail, ok, c.want)
+			t.Errorf("levelFromPSI(%q) = %v, %q, %v; want %v", c.text, got, detail, ok, c.want)
 		}
 	}
-	if _, _, ok := LevelFromPSI("nothing here"); ok {
+	if _, _, ok := levelFromPSI("nothing here"); ok {
 		t.Error("judged text with no pressure lines")
 	}
 }
 
 func TestLevelFromAvailableAndDarwin(t *testing.T) {
-	if LevelFromAvailable(50) != Normal || LevelFromAvailable(8) != Warning || LevelFromAvailable(3) != Critical {
+	if levelFromAvailable(50) != Normal || levelFromAvailable(8) != Warning || levelFromAvailable(3) != Critical {
 		t.Error("available memory judged wrong")
 	}
-	if LevelFromDarwin(1) != Normal || LevelFromDarwin(2) != Warning || LevelFromDarwin(4) != Critical {
+	if levelFromDarwin(1) != Normal || levelFromDarwin(2) != Warning || levelFromDarwin(4) != Critical {
 		t.Error("macOS levels judged wrong")
 	}
 }

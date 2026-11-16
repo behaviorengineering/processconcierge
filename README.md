@@ -35,7 +35,7 @@ Download the archive for your platform from the [releases](https://github.com/be
 Run the child under `processconcierge run`, and tell the reaper how to notice its owner going:
 
 - **`--owner-fd 3`** on macOS and Linux: hand the reaper the read end of a pipe as file descriptor 3. The parent never writes to it, and every way the parent can end, a SIGKILL included, closes it.
-- **`--owner-pid <pid>`** on Windows, where Node passes extra pipes in a way Go does not read: the reaper waits on a handle to the owner's process, which a reused pid cannot fool. It also works on macOS and Linux, where the reaper looks every 200 ms.
+- **`--owner-pid <pid>`** on Windows, where Node passes extra pipes in a way Go does not read: the reaper waits on a handle to the owner's process, which a reused pid cannot fool. It also works on macOS and Linux, where the reaper looks every 200 ms. The reaper refuses `--owner-fd` on Windows.
 
 From Node, on macOS and Linux:
 
@@ -54,10 +54,20 @@ On Windows, pass `'--owner-pid', String(process.pid)` instead of `'--owner-fd', 
 The reaper:
 
 - runs the program in a unit of its own (a process group, or a Job Object on Windows), with the reaper's stdin, stdout and stderr;
-- stops the unit when the program exits, when the reaper gets SIGTERM, SIGINT or SIGHUP, or when its owner goes: SIGTERM first (CTRL_BREAK on Windows, where the program shares a console), then a hard stop for whatever is left after `--grace` (5 seconds by default), leftovers included;
-- exits with the program's code, or 128 plus the signal's number when a signal ended it, 127 when the program could not start, and 75 when no slot came free;
+- stops the unit when the program exits, when the reaper gets SIGTERM, SIGINT or SIGHUP, or when its owner goes: SIGTERM first (CTRL_BREAK on Windows, where the program shares a console), then a hard stop for whatever is left after `--grace` (5 seconds by default), leftovers included. A second stop request during that skips the rest of the grace period;
+- watches for all of these from the moment it starts, so a stop request while it waits for a slot means the program never starts;
+- leaves a program that is stuck inside a kernel call after the hard stop to die by itself: such a program can run none of its own code, and dies when the call returns, so the reaper reports it, keeps its registry entry for the next sweep, and exits rather than wait on it;
 - records the program in the `--registry` folder while it runs, so a later sweep can find it;
 - with `--slots`, takes a slot before starting the program, as below.
+
+It exits with the program's code, or 128 plus the signal's number when a signal ended it, and otherwise with one of its own:
+
+| Code | Meaning |
+| --- | --- |
+| 70 | The program is stuck in the kernel after the hard stop; its registry entry is kept |
+| 75 | No slot came free within `--slot-wait`; the program was not started |
+| 127 | The program could not be started |
+| 143 | A stop request arrived before the program started, so it never did |
 
 At start-up, before starting any children, the parent runs:
 
@@ -65,7 +75,7 @@ At start-up, before starting any children, the parent runs:
 processconcierge sweep --registry "$registryDir"
 ```
 
-It kills the group of every recorded program that is still running, or whose group still holds something the program started, as on Linux, where the parent-death signal ends the program but not its descendants. It passes over any entry whose pid now belongs to another program, which it can tell from the start time the entry records. `--dry-run` reports the same and changes nothing; `--json` prints the results for a program to read.
+It goes through every entry, even when one fails: an entry whose group it could not kill stays for the next sweep, and the results are printed either way. It kills the group of every recorded program that is still running, or whose group still holds something the program started, as on Linux, where the parent-death signal ends the program but not its descendants. It passes over any entry whose pid now belongs to another program, which it can tell from the start time the entry records. `--dry-run` reports the same and changes nothing; `--json` prints the results for a program to read.
 
 ## Slots and memory pressure
 
@@ -102,6 +112,16 @@ if err := reg.Record(ctx, p.Pid()); err != nil {
 }
 defer reg.Remove(p.Pid())
 ```
+
+`Start` tries a start again, up to three more times within about two seconds, only when the system refused it for a reason that passes (too many processes or open files, the program file busy because it is being replaced, Windows antivirus holding it) and no process was created. A start that fails once the child exists is never tried again, so one start never leaves two children. `Stop` returns an error with `CodeStuck` for a child stuck in the kernel after the hard stop.
+
+On macOS, a Go parent that can be killed outright sets `Reaper` to the path of the processconcierge command, so its children run under the reaper and never outlive it:
+
+```go
+p, err := proc.Config{Path: "claude", Args: args, Reaper: "/path/to/processconcierge"}.Start(ctx)
+```
+
+On Linux the parent-death signal already ends the child (though not its grandchildren, which `Reaper` covers too), and on Windows the Job Object ends with the parent, so `Reaper` is optional on Linux and ignored on Windows.
 
 Slots and pressure work the same way from Go:
 

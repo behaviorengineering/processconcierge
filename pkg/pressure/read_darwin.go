@@ -13,5 +13,5 @@ func read(context.Context) (Reading, error) {
 	if err != nil {
 		return Reading{}, err
 	}
-	return Reading{Level: LevelFromDarwin(value), Source: name, Detail: name + "=" + strconv.FormatUint(uint64(value), 10)}, nil
+	return Reading{Level: levelFromDarwin(value), Source: name, Detail: name + "=" + strconv.FormatUint(uint64(value), 10)}, nil
 }

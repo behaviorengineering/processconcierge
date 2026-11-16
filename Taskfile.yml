@@ -39,7 +39,7 @@ tasks:
 
   test:
     desc: Run unit tests with race
-    summary: Runs go test -race -count=1 over every package. The process tests start real processes and need macOS or Linux.
+    summary: Runs go test -race -count=1 over every package. The tests start real processes, on macOS, Linux and Windows.
     cmds:
       - go test -race -count=1 ./...
 
@@ -57,12 +57,12 @@ tasks:
 
   smoke:
     desc: Build the command and smoke-test its guide, help, version, run and sweep
-    summary: Builds the command, then runs the guide, help, version, an unknown command (expects exit 2), run with a program that exits 3 (expects 3) and sweep --dry-run on an empty folder.
+    summary: Builds the command, then runs the guide, help, version, an unknown command (expects exit 2), run with go env GOOS (a program on every platform that builds this module) and sweep --dry-run on an empty folder.
     deps: [build]
     cmds:
       - ./{{.BIN}}
       - ./{{.BIN}} help
       - ./{{.BIN}} version
       - ./{{.BIN}} nope || test $? = 2
-      - ./{{.BIN}} run -- sh -c 'exit 3' || test $? = 3
+      - ./{{.BIN}} run -- go env GOOS
       - ./{{.BIN}} sweep --registry ./bin/no-registry --dry-run

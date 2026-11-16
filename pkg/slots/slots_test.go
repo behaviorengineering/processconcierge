@@ -142,6 +142,17 @@ func TestAnUnreadablePressureSignalHoldsNothingBack(t *testing.T) {
 	_ = slot.Release()
 }
 
+func TestFreeCreatesNothing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "never-made")
+	free, err := (Config{Dir: dir, Count: 3}).Free(context.Background())
+	if err != nil || free != 3 {
+		t.Fatalf("free = %d, err = %v; want all 3 free", free, err)
+	}
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatal("Free made the slots folder")
+	}
+}
+
 func TestTakeRefusesABadConfig(t *testing.T) {
 	ctx := context.Background()
 	for _, cfg := range []Config{{Count: 1}, {Dir: t.TempDir()}, {Dir: t.TempDir(), Count: -1}} {

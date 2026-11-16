@@ -25,6 +25,8 @@ type jobState struct {
 	job    windows.Handle
 	pid    uint32
 	closed bool
+	// gentleFailed is why the last CTRL_BREAK did not reach the child, if it did not.
+	gentleFailed string
 }
 
 // jobAccounting is JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, which x/sys/windows does not define.
@@ -59,8 +61,10 @@ func startInUnit(cmd *exec.Cmd) (unit, error) {
 	pid := uint32(cmd.Process.Pid) //nolint:gosec // G115: Windows process ids are 32-bit.
 	if err := assignAndResume(job, pid); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait() // releases the process handle os/exec holds
 		_ = windows.CloseHandle(job)
-		return unit{}, err
+		// The child existed, so this start is never retried.
+		return unit{}, fmt.Errorf("%w: %w", errAfterCreate, err)
 	}
 	return unit{state: &jobState{job: job, pid: pid}}, nil
 }
@@ -123,14 +127,25 @@ func (u unit) signal(sig os.Signal) error {
 }
 
 // terminate sends CTRL_BREAK to the child's process group. It reaches the child only when both share a console, which
-// a child with piped stdio often does not, so a failure is not an error: the grace period and the hard stop follow.
+// a child with piped stdio often does not, so a failure is not an error: the grace period and the hard stop follow,
+// and gentleFailure says why, for the stop's span.
 func (u unit) terminate() error {
 	u.state.mu.Lock()
 	defer u.state.mu.Unlock()
+	u.state.gentleFailed = ""
 	if !u.state.closed {
-		_ = windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, u.state.pid)
+		if err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, u.state.pid); err != nil {
+			u.state.gentleFailed = err.Error()
+		}
 	}
 	return nil
+}
+
+// gentleFailure says why the last CTRL_BREAK did not reach the child, or nothing when it did.
+func (u unit) gentleFailure() string {
+	u.state.mu.Lock()
+	defer u.state.mu.Unlock()
+	return u.state.gentleFailed
 }
 
 // kill ends every process in the job, then closes the job, whose kill-on-close also ends anything that joined it

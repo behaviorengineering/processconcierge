@@ -1,15 +1,17 @@
-// Package cli is the processconcierge command: the reaper (run), the start-up sweep (sweep) and version. main only
-// calls Execute.
+// Package cli is the processconcierge command: the reaper (run), the start-up sweep (sweep), the inspect commands
+// (pressure, slots) and version. main only calls Execute.
 package cli
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -33,10 +35,16 @@ const (
 
 // Execute runs the command for args and returns the exit code.
 func Execute(ctx context.Context, args []string, stdout, stderr io.Writer, version string) int {
-	shutdown := startTracing(stderr)
-	defer shutdown()
 	code := ExitOK
+	stopTracing := func() {}
+	defer func() { stopTracing() }()
 	root := newRoot(stdout, version, &code)
+	// Only the commands that emit spans set up an exporter, so version and help never reach for the network.
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		if cmd.Name() == "run" || cmd.Name() == "sweep" {
+			stopTracing = startTracing(stderr)
+		}
+	}
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
@@ -91,7 +99,10 @@ func newRun(code *int) *cobra.Command {
 		Long: "Runs the program with this command's own stdin, stdout and stderr, in a process group of its own. When the\n" +
 			"program exits, when this command gets SIGTERM, SIGINT or SIGHUP, or when the owner's pipe closes, it sends\n" +
 			"the group SIGTERM, waits the grace period, then kills whatever is left, and exits with the program's code\n" +
-			"(128 plus the signal's number when a signal ended it). Pass the owner's pipe as an inherited file descriptor\n" +
+			"(128 plus the signal's number when a signal ended it). A second stop request while it stops the program\n" +
+			"skips the grace period. A stop request while it waits for a slot means the program never starts (exit 143),\n" +
+			"and a program stuck in the kernel after the hard stop is left to die by itself (exit 70, its registry entry\n" +
+			"kept for the next sweep). Pass the owner's pipe as an inherited file descriptor\n" +
 			"with --owner-fd; the owner never writes to it, and every way the owner can die closes it. Where the owner\n" +
 			"cannot pass a pipe, as Node on Windows cannot, pass its process id with --owner-pid instead. On Windows the\n" +
 			"program runs in a Job Object that ends with the reaper, however the reaper ends.",
@@ -115,6 +126,10 @@ func newRun(code *int) *cobra.Command {
 				Logger:   logger,
 			}
 			if ownerFD >= 0 {
+				if runtime.GOOS == "windows" {
+					*code = ExitUsage
+					return errors.New("--owner-fd is not supported on Windows; pass --owner-pid with the owner's process id")
+				}
 				cfg.Owner = reaper.OwnerPipe(ownerFD)
 			}
 			cfg.OwnerPID = ownerPID
@@ -133,7 +148,7 @@ func newRun(code *int) *cobra.Command {
 		},
 	}
 	cmd.Flags().SetInterspersed(false)
-	cmd.Flags().IntVar(&ownerFD, "owner-fd", -1, "inherited file descriptor of the owner's pipe; the program is stopped when it closes")
+	cmd.Flags().IntVar(&ownerFD, "owner-fd", -1, "inherited file descriptor of the owner's pipe; the program is stopped when it closes (macOS and Linux)")
 	cmd.Flags().IntVar(&ownerPID, "owner-pid", 0, "the owner's process id; the program is stopped when it exits (use on Windows, where Node cannot pass --owner-fd)")
 	cmd.Flags().DurationVar(&grace, "grace", proc.DefaultGrace, "time between SIGTERM and the hard stop")
 	cmd.Flags().StringVar(&registry, "registry", "", "folder to record the program in while it runs, for a later sweep")
@@ -188,7 +203,7 @@ func newSlots(stdout io.Writer, code *int) *cobra.Command {
 				return err
 			}
 			if asJSON {
-				return encodeJSON(stdout, map[string]any{"dir": dir, "count": count, "free": free}, code)
+				return encodeJSON(stdout, slotsReport{Dir: dir, Count: count, Free: free}, code)
 			}
 			writeln(stdout, "Slots")
 			writeln(stdout, "  Folder:  "+dir)
@@ -204,6 +219,13 @@ func newSlots(stdout io.Writer, code *int) *cobra.Command {
 		panic(err)
 	}
 	return cmd
+}
+
+// slotsReport is what slots --json prints.
+type slotsReport struct {
+	Dir   string `json:"dir"`
+	Count int    `json:"count"`
+	Free  int    `json:"free"`
 }
 
 var levelGloss = map[pressure.Level]string{
@@ -261,14 +283,18 @@ func newSweep(stdout io.Writer, code *int) *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			results, err := sweep.Registry{Dir: registry}.Sweep(cmd.Context(), dryRun)
+			// What the sweep did is printed even when some entries failed, so nothing it stopped goes unreported.
+			if asJSON {
+				if jsonErr := encodeJSON(stdout, results, code); jsonErr != nil {
+					return jsonErr
+				}
+			} else {
+				printSweep(stdout, registry, dryRun, results)
+			}
 			if err != nil {
 				*code = ExitInternal
 				return err
 			}
-			if asJSON {
-				return encodeJSON(stdout, results, code)
-			}
-			printSweep(stdout, registry, dryRun, results)
 			return nil
 		},
 	}
@@ -309,7 +335,8 @@ func printGuide(w io.Writer, version string) {
 	writeln(w, "")
 	writeln(w, "Automation")
 	writeln(w, "  Nothing prompts. Run sweep --dry-run first to see what it would stop.")
-	writeln(w, "  run exits with its program's code, 127 when the program could not start, and 75 when no slot came free.")
+	writeln(w, "  run exits with its program's code; 127 when it could not start, 75 when no slot came free, 143 when")
+	writeln(w, "  asked to stop before it started, and 70 when it is stuck in the kernel after the hard stop.")
 	writeln(w, "  Set OTEL_EXPORTER_OTLP_ENDPOINT to send spans for each start, stop, sweep and slot.")
 	writeln(w, "")
 	writeln(w, "Full command list: processconcierge help")
@@ -318,7 +345,11 @@ func printGuide(w io.Writer, version string) {
 func printSweep(w io.Writer, registry string, dryRun bool, results []sweep.Result) {
 	writeln(w, "Sweep")
 	writeln(w, "  Registry:  "+registry)
-	writeln(w, "  Dry run:   "+map[bool]string{true: "yes", false: "no"}[dryRun])
+	dry := "no"
+	if dryRun {
+		dry = "yes"
+	}
+	writeln(w, "  Dry run:   "+dry)
 	writeln(w, "")
 	writeln(w, "Entries")
 	if len(results) == 0 {

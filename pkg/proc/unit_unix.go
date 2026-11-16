@@ -40,6 +40,11 @@ func (u unit) kill() error {
 	return signalGroup(u.pgid, syscall.SIGKILL)
 }
 
+// gentleFailure is always empty on macOS and Linux, where SIGTERM reaches the group whenever it exists.
+func (u unit) gentleFailure() string {
+	return ""
+}
+
 // empty reports whether nobody is left in the group, the child included.
 func (u unit) empty() bool {
 	return errors.Is(syscall.Kill(-u.pgid, 0), syscall.ESRCH)

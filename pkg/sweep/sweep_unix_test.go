@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shirou/gopsutil/v4/process"
+
 	"github.com/behaviorengineering/processconcierge/pkg/proc"
 )
 
@@ -121,6 +123,50 @@ func TestSweepDropsEntriesForGoneAndUnreadableChildren(t *testing.T) {
 	}
 }
 
+func TestADryRunLeavesUnreadableEntriesInPlace(t *testing.T) {
+	ctx := context.Background()
+	reg := Registry{Dir: t.TempDir()}
+	bad := filepath.Join(reg.Dir, "99.json")
+	if err := os.WriteFile(bad, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := reg.Entries(ctx); err != nil || len(entries) != 0 {
+		t.Fatalf("entries = %+v, err = %v", entries, err)
+	}
+	if _, err := reg.Sweep(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(bad); err != nil {
+		t.Fatal("listing or a dry run deleted the unreadable entry")
+	}
+}
+
+func TestAFailedKillKeepsTheEntryAndTheSweepGoesOn(t *testing.T) {
+	ctx := context.Background()
+	reg := Registry{Dir: t.TempDir()}
+	p := sleeper(t)
+	if err := reg.Record(ctx, p.Pid()); err != nil {
+		t.Fatal(err)
+	}
+	// A root-owned process is alive, started when the entry says, and not ours to kill, so its kill fails.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, so every kill succeeds")
+	}
+	foreign, started := rootProcess(ctx, t)
+	write(t, reg, Entry{PID: foreign, StartedMS: started})
+
+	results, err := reg.Sweep(ctx, false)
+	if err == nil {
+		t.Fatal("a failed kill was not reported")
+	}
+	if len(results) != 1 || results[0].Entry.PID != p.Pid() || results[0].Outcome != Stopped {
+		t.Fatalf("results = %+v, want the sleeper stopped despite the failure", results)
+	}
+	if _, statErr := os.Stat(reg.path(foreign)); statErr != nil {
+		t.Fatal("the entry whose kill failed was removed")
+	}
+}
+
 func TestEntriesOfAMissingFolderAreNone(t *testing.T) {
 	entries, err := Registry{Dir: filepath.Join(t.TempDir(), "never-made")}.Entries(context.Background())
 	if err != nil || len(entries) != 0 {
@@ -189,4 +235,28 @@ func TestSweepStopsAGroupThatOutlivedItsLeader(t *testing.T) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+// rootProcess finds a running process owned by root, other than process 1, and its start time.
+func rootProcess(ctx context.Context, t *testing.T) (int, int64) {
+	t.Helper()
+	procs, err := process.ProcessesWithContext(ctx)
+	if err != nil {
+		t.Skip("cannot list processes here")
+	}
+	for _, p := range procs {
+		if p.Pid <= 1 {
+			continue
+		}
+		uids, err := p.UidsWithContext(ctx)
+		if err != nil || len(uids) == 0 || uids[0] != 0 {
+			continue
+		}
+		started, err := p.CreateTimeWithContext(ctx)
+		if err == nil {
+			return int(p.Pid), started
+		}
+	}
+	t.Skip("no root-owned process found")
+	return 0, 0
 }

@@ -2,10 +2,8 @@ package pressure
 
 import (
 	"context"
-	"strconv"
 	"sync"
 
-	"github.com/shirou/gopsutil/v4/mem"
 	"golang.org/x/sys/windows"
 )
 
@@ -35,14 +33,13 @@ func lowMemorySignalled() bool {
 }
 
 func read(ctx context.Context) (Reading, error) {
-	vm, err := mem.VirtualMemoryWithContext(ctx)
+	r, err := fromAvailable(ctx)
 	if err != nil {
 		return Reading{}, err
 	}
-	available := 100 - vm.UsedPercent
-	detail := "available=" + strconv.FormatFloat(available, 'f', 1, 64) + "%"
 	if lowMemorySignalled() {
-		return Reading{Level: Critical, Source: "low-memory notification", Detail: detail}, nil
+		r.Level = Critical
+		r.Source = "low-memory notification"
 	}
-	return Reading{Level: LevelFromAvailable(available), Source: "available memory", Detail: detail}, nil
+	return r, nil
 }

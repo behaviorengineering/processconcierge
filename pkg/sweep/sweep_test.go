@@ -6,17 +6,12 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/behaviorengineering/processconcierge/internal/proctest"
 )
 
-// sleeperEnv makes the test binary sleep a minute instead of running the tests, so every platform has a plain child
-// to record and sweep.
-const sleeperEnv = "PROCESSCONCIERGE_TEST_SLEEPER"
-
 func TestMain(m *testing.M) {
-	if os.Getenv(sleeperEnv) != "" {
-		time.Sleep(time.Minute)
-		os.Exit(0)
-	}
+	proctest.RunHelperIfAsked()
 	os.Exit(m.Run())
 }
 
@@ -26,7 +21,7 @@ func TestSweepStopsAChildALostSupervisorLeftRunning(t *testing.T) {
 	ctx := context.Background()
 	reg := Registry{Dir: t.TempDir()}
 	child := exec.Command(os.Args[0]) //nolint:gosec // G204: the test binary itself.
-	child.Env = append(os.Environ(), sleeperEnv+"=1")
+	child.Env = proctest.Env(proctest.Sleep, "")
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
 	}

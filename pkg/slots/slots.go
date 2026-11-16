@@ -6,6 +6,8 @@ package slots
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/behaviorengineering/processconcierge/pkg/pressure"
 	"github.com/behaviorengineering/processconcierge/pkg/procerr"
@@ -66,6 +69,9 @@ func (c Config) Take(ctx context.Context) (*Slot, error) {
 	if err := c.check(ctx, op); err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
+		return nil, procerr.Wrap(err, procerr.CodeSlot, op, "make the slots folder").With("dir", c.Dir)
+	}
 	ctx, span := tracer.Start(ctx, "processconcierge.slots.take")
 	defer span.End()
 	span.SetAttributes(attribute.String("slots.dir", c.Dir), attribute.Int("slots.count", c.Count))
@@ -73,12 +79,7 @@ func (c Config) Take(ctx context.Context) (*Slot, error) {
 	ticker := time.NewTicker(c.poll())
 	defer ticker.Stop()
 	for {
-		held, err := c.heldBack(ctx)
-		if err != nil {
-			span.SetStatus(codes.Error, err.Error())
-			return nil, err
-		}
-		if !held {
+		if !c.heldBack(ctx) {
 			slot, err := c.tryAll()
 			if err != nil {
 				span.SetStatus(codes.Error, err.Error())
@@ -99,7 +100,8 @@ func (c Config) Take(ctx context.Context) (*Slot, error) {
 	}
 }
 
-// Free counts the slots no one holds right now, by trying each and letting go at once.
+// Free counts the slots no one holds right now, by trying each and letting go at once. It creates nothing: a missing
+// folder or slot file is a free slot.
 func (c Config) Free(ctx context.Context) (int, error) {
 	const op = "slots.Free"
 	if err := c.check(ctx, op); err != nil {
@@ -107,6 +109,10 @@ func (c Config) Free(ctx context.Context) (int, error) {
 	}
 	free := 0
 	for i := range c.Count {
+		if _, err := os.Stat(c.path(i)); errors.Is(err, fs.ErrNotExist) {
+			free++
+			continue
+		}
 		lock := flock.New(c.path(i))
 		ok, err := lock.TryLock()
 		if err != nil {
@@ -136,20 +142,22 @@ func (c Config) tryAll() (*Slot, error) {
 	return nil, nil
 }
 
-func (c Config) heldBack(ctx context.Context) (bool, error) {
+// heldBack reports whether memory is short enough to hold slots back. A reading that fails holds nothing back, since
+// the slots still limit how many start; it is recorded on the span, so a signal that never reads stands out.
+func (c Config) heldBack(ctx context.Context) bool {
 	if c.Pressure == nil {
-		return false, nil
+		return false
 	}
 	reading, err := c.Pressure(ctx)
 	if err != nil {
-		// A pressure reading that fails holds nothing back: the slots still limit how many start.
-		return false, nil //nolint:nilerr // an unreadable pressure signal must not stop every start.
+		trace.SpanFromContext(ctx).AddEvent("pressure unreadable", trace.WithAttributes(attribute.String("error", err.Error())))
+		return false
 	}
 	holdAt := c.HoldAt
 	if holdAt == pressure.Normal {
 		holdAt = pressure.Critical
 	}
-	return reading.Level >= holdAt, nil
+	return reading.Level >= holdAt
 }
 
 func (c Config) check(ctx context.Context, op string) error {
@@ -161,9 +169,6 @@ func (c Config) check(ctx context.Context, op string) error {
 	}
 	if c.Count <= 0 {
 		return procerr.New(procerr.CodeInvalid, op, "the slot count must be at least 1").With("count", c.Count)
-	}
-	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
-		return procerr.Wrap(err, procerr.CodeSlot, op, "make the slots folder").With("dir", c.Dir)
 	}
 	return nil
 }

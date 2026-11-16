@@ -79,7 +79,7 @@ func Read(ctx context.Context) (Reading, error) {
 	}
 	r, err := read(ctx)
 	if err != nil {
-		return Reading{}, procerr.Wrap(err, procerr.CodeUnsupported, op, "read memory pressure")
+		return Reading{}, procerr.Wrap(err, procerr.CodePressure, op, "read memory pressure")
 	}
 	return r, nil
 }
@@ -124,9 +124,9 @@ func Watch(ctx context.Context, interval time.Duration) <-chan Reading {
 	return out
 }
 
-// LevelFromPSI judges Linux's /proc/pressure/memory: "full" over PSICritical is critical, "some" over PSIWarning is a
+// levelFromPSI judges Linux's /proc/pressure/memory: "full" over PSICritical is critical, "some" over PSIWarning is a
 // warning. It reports false when the text holds neither line.
-func LevelFromPSI(text string) (Level, string, bool) {
+func levelFromPSI(text string) (Level, string, bool) {
 	some, okSome := psiAvg10(text, "some")
 	full, okFull := psiAvg10(text, "full")
 	if !okSome && !okFull {
@@ -160,8 +160,8 @@ func psiAvg10(text, kind string) (float64, bool) {
 	return 0, false
 }
 
-// LevelFromAvailable judges the percent of memory still available.
-func LevelFromAvailable(availablePercent float64) Level {
+// levelFromAvailable judges the percent of memory still available.
+func levelFromAvailable(availablePercent float64) Level {
 	switch {
 	case availablePercent < AvailableCritical:
 		return Critical
@@ -172,8 +172,8 @@ func LevelFromAvailable(availablePercent float64) Level {
 	}
 }
 
-// LevelFromDarwin turns macOS's kern.memorystatus_vm_pressure_level (1 normal, 2 warning, 4 critical) into a level.
-func LevelFromDarwin(value uint32) Level {
+// levelFromDarwin turns macOS's kern.memorystatus_vm_pressure_level (1 normal, 2 warning, 4 critical) into a level.
+func levelFromDarwin(value uint32) Level {
 	switch {
 	case value >= 4:
 		return Critical
