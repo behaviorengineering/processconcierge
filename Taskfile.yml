@@ -1,0 +1,68 @@
+version: "3"
+
+vars:
+  BIN: processconcierge{{exeExt}}
+
+env:
+  GOWORK: "off"
+
+tasks:
+  default:
+    desc: List local-dev tasks
+    summary: Prints every task with its one-line description.
+    cmds:
+      - go tool task --list
+
+  format:
+    desc: Format with gofumpt
+    summary: Rewrites the Go files under cmd, internal and pkg in gofumpt style, in place.
+    cmds:
+      - go tool gofumpt -w ./cmd ./internal ./pkg
+
+  lint:
+    desc: Run golangci-lint
+    summary: Runs the pinned golangci-lint v2 with .golangci.yml over cmd, internal and pkg, with a five-minute limit.
+    cmds:
+      - go tool golangci-lint run --timeout 5m ./cmd/... ./internal/... ./pkg/...
+
+  vet:
+    desc: Run go vet for this system, Linux and Windows
+    summary: Runs go vet over every package for this system, then for Linux and Windows, so each platform's files compile.
+    cmds:
+      - go vet ./...
+      - cmd: go vet ./...
+        env:
+          GOOS: linux
+      - cmd: go vet ./...
+        env:
+          GOOS: windows
+
+  test:
+    desc: Run unit tests with race
+    summary: Runs go test -race -count=1 over every package. The process tests start real processes and need macOS or Linux.
+    cmds:
+      - go test -race -count=1 ./...
+
+  tidy:
+    desc: go mod tidy
+    summary: Runs go mod tidy, so go.mod and go.sum list exactly what the code imports.
+    cmds:
+      - go mod tidy
+
+  build:
+    desc: Build the processconcierge command
+    summary: Builds ./cmd/processconcierge into the processconcierge binary at the module root.
+    cmds:
+      - go build -o {{.BIN}} ./cmd/processconcierge
+
+  smoke:
+    desc: Build the command and smoke-test its guide, help, version, run and sweep
+    summary: Builds the command, then runs the guide, help, version, an unknown command (expects exit 2), run with a program that exits 3 (expects 3) and sweep --dry-run on an empty folder.
+    deps: [build]
+    cmds:
+      - ./{{.BIN}}
+      - ./{{.BIN}} help
+      - ./{{.BIN}} version
+      - ./{{.BIN}} nope || test $? = 2
+      - ./{{.BIN}} run -- sh -c 'exit 3' || test $? = 3
+      - ./{{.BIN}} sweep --registry ./bin/no-registry --dry-run

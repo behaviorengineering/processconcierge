@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.0"
+          cache: true
+
+      - name: Verify modules tidy
+        run: |
+          cp go.mod go.mod.bak && cp go.sum go.sum.bak
+          go tool task tidy
+          diff -u go.mod.bak go.mod
+          diff -u go.sum.bak go.sum
+          rm -f go.mod.bak go.sum.bak
+
+      - name: Format check
+        run: |
+          unformatted=$(go tool gofumpt -l ./cmd ./internal ./pkg)
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet (this system, Linux and Windows)
+        run: go tool task vet
+
+      - name: Lint
+        run: go tool task lint
+
+      - name: Test
+        run: go tool task test
+
+      - name: CLI smoke
+        run: go tool task smoke
