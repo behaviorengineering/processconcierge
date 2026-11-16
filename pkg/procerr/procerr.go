@@ -26,6 +26,8 @@ const (
 	CodeWait Code = "wait"
 	// CodeRegistry means the file of process ids could not be read or written.
 	CodeRegistry Code = "registry"
+	// CodeSlot means a slot could not be taken or released, or none came free in time.
+	CodeSlot Code = "slot"
 )
 
 // Error is a failure with a stable code.

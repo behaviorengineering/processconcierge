@@ -17,10 +17,14 @@ import (
 	"strings"
 
 	"github.com/shirou/gopsutil/v4/process"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/behaviorengineering/processconcierge/pkg/proc"
 	"github.com/behaviorengineering/processconcierge/pkg/procerr"
 )
+
+var tracer = otel.Tracer("github.com/behaviorengineering/processconcierge/pkg/sweep")
 
 // Entry is one supervised child.
 type Entry struct {
@@ -143,6 +147,15 @@ func (r Registry) Sweep(ctx context.Context, dryRun bool) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	ctx, span := tracer.Start(ctx, "processconcierge.sweep")
+	defer span.End()
+	counts := map[Outcome]int{}
+	defer func() {
+		span.SetAttributes(attribute.String("sweep.dir", r.Dir), attribute.Bool("sweep.dry_run", dryRun),
+			attribute.Int("sweep.entries", len(entries)), attribute.Int("sweep.stopped", counts[Stopped]),
+			attribute.Int("sweep.would_stop", counts[WouldStop]), attribute.Int("sweep.gone", counts[Gone]),
+			attribute.Int("sweep.reused", counts[Reused]))
+	}()
 	results := make([]Result, 0, len(entries))
 	for _, entry := range entries {
 		outcome := r.judge(ctx, entry)
@@ -159,6 +172,7 @@ func (r Registry) Sweep(ctx context.Context, dryRun bool) ([]Result, error) {
 				return results, err
 			}
 		}
+		counts[outcome]++
 		results = append(results, Result{Entry: entry, Outcome: outcome})
 	}
 	return results, nil

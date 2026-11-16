@@ -12,8 +12,22 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/behaviorengineering/processconcierge/pkg/procerr"
 )
+
+var tracer = otel.Tracer("github.com/behaviorengineering/processconcierge/pkg/proc")
+
+// fail marks a span as failed and hands the error back.
+func fail(span trace.Span, err error) error {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	return err
+}
 
 // DefaultGrace is how long Stop waits after the gentle signal before it stops the whole unit for good.
 const DefaultGrace = 5 * time.Second
@@ -81,6 +95,8 @@ func (c Config) Start(ctx context.Context) (*Process, error) {
 	if grace <= 0 {
 		grace = DefaultGrace
 	}
+	_, span := tracer.Start(ctx, "processconcierge.start", trace.WithAttributes(attribute.String("process.path", c.Path)))
+	defer span.End()
 	cmd := exec.Command(c.Path, c.Args...) //nolint:gosec // G204: running the caller's program is this package's job.
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
@@ -89,8 +105,9 @@ func (c Config) Start(ctx context.Context) (*Process, error) {
 	cmd.Stderr = c.Stderr
 	u, err := startInUnit(cmd)
 	if err != nil {
-		return nil, procerr.Wrap(err, procerr.CodeStart, op, "start the child").With("path", c.Path)
+		return nil, fail(span, procerr.Wrap(err, procerr.CodeStart, op, "start the child").With("path", c.Path))
 	}
+	span.SetAttributes(attribute.Int("process.pid", cmd.Process.Pid))
 	p := &Process{cmd: cmd, grace: grace, unit: u, done: make(chan struct{})}
 	go p.wait()
 	return p, nil
@@ -154,30 +171,37 @@ func (p *Process) Stop(ctx context.Context) error {
 	if ctx == nil {
 		return procerr.New(procerr.CodeInvalid, op, "context is required")
 	}
+	ctx, span := tracer.Start(ctx, "processconcierge.stop", trace.WithAttributes(
+		attribute.Int("process.pid", p.Pid()), attribute.Int64("process.grace_ms", p.grace.Milliseconds())))
+	defer span.End()
 	if err := p.unit.terminate(); err != nil {
-		return procerr.Wrap(err, procerr.CodeSignal, op, "send the gentle signal").With("pid", p.Pid())
+		return fail(span, procerr.Wrap(err, procerr.CodeSignal, op, "send the gentle signal").With("pid", p.Pid()))
 	}
-	if err := p.settle(ctx, p.grace); err != nil {
-		return procerr.Wrap(err, procerr.CodeWait, op, "stopped before the grace period ended").With("pid", p.Pid())
+	settled, err := p.settle(ctx, p.grace)
+	if err != nil {
+		return fail(span, procerr.Wrap(err, procerr.CodeWait, op, "stopped before the grace period ended").With("pid", p.Pid()))
 	}
+	// True when something was still running once the grace period ended, and only the hard stop ended it.
+	span.SetAttributes(attribute.Bool("process.hard_stop", !settled))
 	// Whatever is still in the unit after the gentle signal and the grace period is stopped for good.
 	if err := p.unit.kill(); err != nil {
-		return procerr.Wrap(err, procerr.CodeSignal, op, "kill what is left of the unit").With("pid", p.Pid())
+		return fail(span, procerr.Wrap(err, procerr.CodeSignal, op, "kill what is left of the unit").With("pid", p.Pid()))
 	}
 	select {
 	case <-p.done:
+		span.SetAttributes(attribute.Int("process.exit_code", p.exit.Code), attribute.String("process.exit_signal", p.exit.Signal))
 		return nil
 	case <-ctx.Done():
-		return procerr.Wrap(ctx.Err(), procerr.CodeWait, op, "stopped before the child exited").With("pid", p.Pid())
+		return fail(span, procerr.Wrap(ctx.Err(), procerr.CodeWait, op, "stopped before the child exited").With("pid", p.Pid()))
 	}
 }
 
 // settlePoll is how often Stop looks whether the unit has emptied during the grace period.
 const settlePoll = 25 * time.Millisecond
 
-// settle waits until the child has exited and its unit is empty, or the grace period ends. Only ctx ending is an
-// error; a grace period that runs out leaves the rest to the hard stop.
-func (p *Process) settle(ctx context.Context, grace time.Duration) error {
+// settle waits until the child has exited and its unit is empty, or the grace period ends, and reports which. Only
+// ctx ending is an error; a grace period that runs out leaves the rest to the hard stop.
+func (p *Process) settle(ctx context.Context, grace time.Duration) (bool, error) {
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	tick := time.NewTicker(settlePoll)
@@ -186,15 +210,15 @@ func (p *Process) settle(ctx context.Context, grace time.Duration) error {
 		select {
 		case <-p.done:
 			if p.unit.empty() {
-				return nil
+				return true, nil
 			}
 		default:
 		}
 		select {
 		case <-timer.C:
-			return nil
+			return false, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-tick.C:
 		}
 	}

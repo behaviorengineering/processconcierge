@@ -51,12 +51,19 @@ func GroupAlive(pgid int) bool {
 	return pgid > 1 && !errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH)
 }
 
-// KillGroup kills every process in the group pgid leads. A group with nobody left in it is not an error.
+// KillGroup kills every process in the group pgid leads, and the process with that pid, which a child started without
+// a group of its own needs. A group or process already gone is not an error.
 func KillGroup(pgid int) error {
 	if pgid <= 1 {
 		return fmt.Errorf("refusing to kill group %d", pgid)
 	}
-	return signalGroup(pgid, syscall.SIGKILL)
+	if err := signalGroup(pgid, syscall.SIGKILL); err != nil {
+		return err
+	}
+	if err := syscall.Kill(pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
 }
 
 func signalGroup(pgid int, sig syscall.Signal) error {

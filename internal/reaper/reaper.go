@@ -15,10 +15,16 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/behaviorengineering/processconcierge/pkg/proc"
 	"github.com/behaviorengineering/processconcierge/pkg/procerr"
+	"github.com/behaviorengineering/processconcierge/pkg/slots"
 	"github.com/behaviorengineering/processconcierge/pkg/sweep"
 )
+
+var tracer = otel.Tracer("github.com/behaviorengineering/processconcierge/internal/reaper")
 
 // Exit codes the reaper uses for itself; otherwise it exits with the child's.
 const (
@@ -26,6 +32,8 @@ const (
 	ExitInternal = 1
 	// ExitNotStarted means the child could not be started, as a shell reports a command it cannot run.
 	ExitNotStarted = 127
+	// ExitNoSlot means no slot came free in time, so the child was not started: try again later (EX_TEMPFAIL).
+	ExitNoSlot = 75
 )
 
 // Config is one run of the reaper.
@@ -42,6 +50,11 @@ type Config struct {
 	// Registry is the folder the child is recorded in while it runs, so a later sweep can find it; empty records
 	// nothing.
 	Registry string
+	// Slots, when set, must give the reaper a slot before it starts the child; the reaper holds it until the child's
+	// unit has stopped, and the system gives it back if the reaper dies.
+	Slots *slots.Config
+	// SlotWait is how long to wait for a slot before giving up with ExitNoSlot. Zero waits as long as ctx allows.
+	SlotWait time.Duration
 	// Signals carries the stop requests the reaper receives, such as SIGTERM. Nil means none.
 	Signals <-chan os.Signal
 	// Logger receives what the reaper does. Nil discards it.
@@ -62,6 +75,18 @@ func (c Config) Run(ctx context.Context) (int, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if c.Slots != nil {
+		slot, err := c.takeSlot(ctx)
+		if err != nil {
+			return ExitNoSlot, err
+		}
+		logger.Info("slot taken.", "slot", slot.Index)
+		defer func() {
+			if err := slot.Release(); err != nil {
+				logger.Error("could not release the slot.", "slot", slot.Index, "error", err)
+			}
+		}()
+	}
 	child, err := proc.Config{
 		Path:   c.Path,
 		Args:   c.Args,
@@ -75,25 +100,20 @@ func (c Config) Run(ctx context.Context) (int, error) {
 	}
 	logger.Info("child started.", "pid", child.Pid(), "path", c.Path)
 
-	if c.Registry != "" {
-		reg := sweep.Registry{Dir: c.Registry}
-		if err := reg.Record(ctx, child.Pid()); err != nil {
-			logger.Error("could not record the child, so stopping it.", "pid", child.Pid(), "error", err)
-			if stopErr := child.Stop(ctx); stopErr != nil {
-				logger.Error("could not stop the child.", "pid", child.Pid(), "error", stopErr)
-			}
-			return ExitInternal, procerr.Wrap(err, procerr.CodeRegistry, op, "record the child").With("pid", child.Pid())
-		}
-		defer func() {
-			if err := reg.Remove(child.Pid()); err != nil {
-				logger.Error("could not remove the child's entry.", "pid", child.Pid(), "error", err)
-			}
-		}()
+	forget, err := c.record(ctx, child, logger)
+	if err != nil {
+		return ExitInternal, err
 	}
+	defer forget()
 
-	logger.Info("stopping the child's unit.", "pid", child.Pid(), "reason", c.awaitReason(child))
+	reason := c.awaitReason(child)
+	logger.Info("stopping the child's unit.", "pid", child.Pid(), "reason", reason)
+	stopCtx, span := tracer.Start(ctx, "processconcierge.reaper.stop")
+	span.SetAttributes(attribute.Int("process.pid", child.Pid()), attribute.String("reaper.reason", reason))
 	// Stop also clears a unit whose child already exited, so nothing the child started outlives it.
-	if err := child.Stop(ctx); err != nil {
+	err = child.Stop(stopCtx)
+	span.End()
+	if err != nil {
 		return ExitInternal, procerr.Wrap(err, procerr.CodeSignal, op, "stop the child's unit").With("pid", child.Pid())
 	}
 	exit, err := child.Wait(ctx)
@@ -128,4 +148,38 @@ func (c Config) awaitReason(child *proc.Process) string {
 	case <-ownerExited:
 		return "the owner's process exited"
 	}
+}
+
+func (c Config) takeSlot(ctx context.Context) (*slots.Slot, error) {
+	if c.SlotWait > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.SlotWait)
+		defer cancel()
+	}
+	slot, err := c.Slots.Take(ctx)
+	if err != nil {
+		return nil, procerr.Wrap(err, procerr.CodeSlot, "reaper.Run", "take a slot").With("dir", c.Slots.Dir)
+	}
+	return slot, nil
+}
+
+// record adds the child to the registry, when there is one, and returns the function that removes it. A child that
+// cannot be recorded is stopped, since a later sweep could not find it.
+func (c Config) record(ctx context.Context, child *proc.Process, logger *slog.Logger) (func(), error) {
+	if c.Registry == "" {
+		return func() {}, nil
+	}
+	reg := sweep.Registry{Dir: c.Registry}
+	if err := reg.Record(ctx, child.Pid()); err != nil {
+		logger.Error("could not record the child, so stopping it.", "pid", child.Pid(), "error", err)
+		if stopErr := child.Stop(ctx); stopErr != nil {
+			logger.Error("could not stop the child.", "pid", child.Pid(), "error", stopErr)
+		}
+		return nil, procerr.Wrap(err, procerr.CodeRegistry, "reaper.Run", "record the child").With("pid", child.Pid())
+	}
+	return func() {
+		if err := reg.Remove(child.Pid()); err != nil {
+			logger.Error("could not remove the child's entry.", "pid", child.Pid(), "error", err)
+		}
+	}, nil
 }

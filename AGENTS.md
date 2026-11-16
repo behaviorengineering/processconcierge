@@ -4,8 +4,10 @@ processconcierge supervises child processes so nothing they start outlives them.
 
 ## Layout
 
-- `pkg/proc`: start a child in a unit (a process group on macOS and Linux, a Job Object on Windows once supported) and stop the whole unit, gently then for good.
+- `pkg/proc`: start a child in a unit (a process group on macOS and Linux, a kill-on-close Job Object on Windows) and stop the whole unit, gently then for good.
 - `pkg/sweep`: the registry folder of supervised children and the start-up sweep.
+- `pkg/slots`: slots shared across programs through a folder of OS file locks, held back under memory pressure.
+- `pkg/pressure`: each platform's memory pressure signal, read once or watched.
 - `pkg/procerr`: the typed errors every package returns, each with a stable `Code`.
 - `internal/reaper`: one tini-style run for a parent that cannot supervise processes itself.
 - `internal/cli` and `cmd/processconcierge`: the Cobra command (`run`, `sweep`, `version`); `main` only calls `cli.Execute`.
@@ -17,4 +19,6 @@ processconcierge supervises child processes so nothing they start outlives them.
 - Each platform's code lives in its own file with a build tag or a `_linux`, `_windows` suffix. A change to one platform MUST keep the others building: `go tool task vet` vets this system, Linux and Windows.
 - A child's unit is the only thing ever signalled. MUST NOT signal a bare pid that might have been reused; the sweep checks the start time first.
 - Supervision never retries: starting a long-lived child again is the owner's decision, not this library's.
-- Run `go tool task format lint vet test smoke` before calling a change done. The tests start real processes, so they run on macOS and Linux.
+- Libraries emit spans on the global tracer provider and never install one; only `internal/cli` sets up olly.
+- Run `go tool task format lint vet test smoke` before calling a change done. The tests start real processes; CI runs them on macOS, Linux and Windows, and Windows code is only proven there.
+- Releases: merging to `main` tags the next patch and publishes binaries for six platforms (`auto-patch-release.yml`, GoReleaser). Bump minor or major by running that workflow by hand.

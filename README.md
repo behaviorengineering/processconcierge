@@ -18,17 +18,26 @@ processconcierge is built from the operating system's own tools for this: proces
 
 | | Holds the child and what it starts | When the parent dies |
 | --- | --- | --- |
-| macOS | A process group | The reaper sees its owner's pipe close and stops the group |
+| macOS | A process group | The reaper sees its owner go and stops the group |
 | Linux | A process group | The same, and the kernel's parent-death signal stops the child even if the reaper is killed outright |
-| Windows | Not yet: a kill-on-close Job Object is next | Not yet |
+| Windows | A Job Object that kills every process in it when its last handle closes, joined before the child runs | The reaper sees its owner go and stops the job; and if the reaper itself is killed, Windows ends the job |
 
-A child that moves itself into a new process group escapes a group stop on macOS and Linux. The registry and its sweep catch it at the next start.
+A child that moves itself into a new process group escapes a group stop on macOS and Linux. The registry and its sweep catch it at the next start. On Windows nothing escapes: a job allows no breakaway.
+
+## Install
+
+Download the archive for your platform from the [releases](https://github.com/behaviorengineering/processconcierge/releases): macOS, Linux and Windows, each on amd64 and arm64, with a `checksums.txt`. An app such as Totem ships the binary for each platform it runs on.
+
+`go install github.com/behaviorengineering/processconcierge/cmd/processconcierge@latest` also works; its `version` reports the module version.
 
 ## The reaper, for a parent that is not Go
 
-Run the child under `processconcierge run`, and hand it the read end of a pipe as file descriptor 3. The parent never writes to the pipe. Every way the parent can end, a SIGKILL included, closes it, and the reaper then stops the child's whole group.
+Run the child under `processconcierge run`, and tell the reaper how to notice its owner going:
 
-From Node:
+- **`--owner-fd 3`** on macOS and Linux: hand the reaper the read end of a pipe as file descriptor 3. The parent never writes to it, and every way the parent can end, a SIGKILL included, closes it.
+- **`--owner-pid <pid>`** on Windows, where Node passes extra pipes in a way Go does not read: the reaper waits on a handle to the owner's process, which a reused pid cannot fool. It also works on macOS and Linux, where the reaper looks every 200 ms.
+
+From Node, on macOS and Linux:
 
 ```js
 import { spawn } from 'child_process';
@@ -40,12 +49,15 @@ const child = spawn('processconcierge', [
 // child.stdin and child.stdout are the program's own: the reaper passes them through untouched.
 ```
 
+On Windows, pass `'--owner-pid', String(process.pid)` instead of `'--owner-fd', '3'`, with the usual three stdio pipes.
+
 The reaper:
 
-- runs the program in a process group of its own, with the reaper's stdin, stdout and stderr;
-- stops the group when the program exits, when the reaper gets SIGTERM, SIGINT or SIGHUP, or when the owner's pipe closes: SIGTERM first, then SIGKILL for whatever is left after `--grace` (5 seconds by default);
-- exits with the program's code, or 128 plus the signal's number when a signal ended it, and 127 when the program could not start;
-- records the program in the `--registry` folder while it runs, so a later sweep can find it.
+- runs the program in a unit of its own (a process group, or a Job Object on Windows), with the reaper's stdin, stdout and stderr;
+- stops the unit when the program exits, when the reaper gets SIGTERM, SIGINT or SIGHUP, or when its owner goes: SIGTERM first (CTRL_BREAK on Windows, where the program shares a console), then a hard stop for whatever is left after `--grace` (5 seconds by default), leftovers included;
+- exits with the program's code, or 128 plus the signal's number when a signal ended it, 127 when the program could not start, and 75 when no slot came free;
+- records the program in the `--registry` folder while it runs, so a later sweep can find it;
+- with `--slots`, takes a slot before starting the program, as below.
 
 At start-up, before starting any children, the parent runs:
 
@@ -54,6 +66,26 @@ processconcierge sweep --registry "$registryDir"
 ```
 
 It kills the group of every recorded program that is still running, or whose group still holds something the program started, as on Linux, where the parent-death signal ends the program but not its descendants. It passes over any entry whose pid now belongs to another program, which it can tell from the start time the entry records. `--dry-run` reports the same and changes nothing; `--json` prints the results for a program to read.
+
+## Slots and memory pressure
+
+Several programs on one machine can share a limit on how many children run at once. Each passes the same folder and count:
+
+```sh
+processconcierge run --slots ~/.cache/myapp/slots --slot-count 8 --slot-wait 30s -- claude
+```
+
+Each slot is a file held with an operating-system file lock (flock on macOS and Linux, LockFileEx on Windows). The system lets go of a lock when its holder ends, however it ends, so a crash never leaks a slot and nothing needs cleaning up. While every slot is held, the reaper waits up to `--slot-wait`, then exits 75 without starting the program.
+
+Slots are also held back while the machine is short of memory, at `--hold-at critical` by default (or `warning`). The reading comes from each platform's own signal:
+
+| | Signal |
+| --- | --- |
+| macOS | The kernel's `kern.memorystatus_vm_pressure_level` |
+| Linux | Pressure stall information in `/proc/pressure/memory`, or available memory on kernels without it |
+| Windows | The system's low-memory notification, then the share of memory still available |
+
+`processconcierge pressure` shows the reading, and `processconcierge slots --dir <folder>` shows how many slots are free; both take `--json`.
 
 ## From Go
 
@@ -71,19 +103,30 @@ if err := reg.Record(ctx, p.Pid()); err != nil {
 defer reg.Remove(p.Pid())
 ```
 
+Slots and pressure work the same way from Go:
+
+```go
+slot, err := slots.Config{Dir: dir, Count: 8, Pressure: pressure.Read}.Take(ctx)
+if err != nil {
+    return err
+}
+defer slot.Release()
+
+for reading := range pressure.Watch(ctx, 2*time.Second) {
+    // Sent first, then on every change of level: close idle children at Warning or Critical.
+}
+```
+
 Every error is a `*procerr.Error` with a stable `Code`, so callers can match `procerr.Is(err, procerr.CodeStart)` and still reach the cause.
 
-## Coming next
+## Tracing
 
-- **Windows:** each child in a kill-on-close Job Object, created before the child runs.
-- **Slots:** crash-safe slot files, held with OS file locks, that programs on the same machine share, so they never start more children between them than the machine can hold.
-- **Memory pressure:** a watch on each platform's own signal, which stops new starts and tells the parent, which decides what to close.
-- **Tracing:** spans for each start, stop and sweep, through [olly](https://github.com/behaviorengineering/olly).
+Each start, stop, sweep, slot taken and change of memory pressure is an OpenTelemetry span on the global tracer provider. The library never installs one; the app does, with [olly](https://github.com/behaviorengineering/olly) or its own. The `processconcierge` command sends its spans when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. A stop's span says whether the hard stop was needed (`process.hard_stop`), so a trace shows which programs ignore SIGTERM.
 
 ## Working on it
 
 ```sh
 go tool task          # the list of tasks
-go tool task test     # starts real processes; runs on macOS and Linux
+go tool task test     # starts real processes, on macOS, Linux and Windows
 go tool task vet      # vets this system, Linux and Windows
 ```

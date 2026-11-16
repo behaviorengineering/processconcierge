@@ -196,3 +196,29 @@ func TestTheReaperStopsTheProgramWhenTheOwnersProcessExits(t *testing.T) {
 	}
 	waitFor(t, "the grandchild outlived its owner", func() bool { return !alive(grandchild) })
 }
+
+func TestASecondReaperWaitsForTheOneSlotAndGivesUpWith75(t *testing.T) {
+	dir := t.TempDir()
+	slotsDir := filepath.Join(dir, "slots")
+	ready := filepath.Join(dir, "ready")
+	first, owner := startReaper(t, "echo $$ > "+ready+"; sleep 60", "--slots", slotsDir, "--slot-count", "1")
+	readPid(t, ready)
+
+	second := exec.Command(binary, "run", "--slots", slotsDir, "--slot-count", "1", "--slot-wait", "300ms", "--", "/bin/sh", "-c", "exit 0") //nolint:gosec // G204: the command these tests built.
+	if err := second.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if code := exitCode(t, second); code != 75 {
+		t.Fatalf("the second reaper exited %d, want 75 for no free slot", code)
+	}
+
+	_ = owner.Close()
+	exitCode(t, first)
+	third := exec.Command(binary, "run", "--slots", slotsDir, "--slot-count", "1", "--slot-wait", "5s", "--", "/bin/sh", "-c", "exit 0") //nolint:gosec // G204: the command these tests built.
+	if err := third.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if code := exitCode(t, third); code != 0 {
+		t.Fatalf("a reaper after the first ended exited %d, so the slot never came back", code)
+	}
+}
