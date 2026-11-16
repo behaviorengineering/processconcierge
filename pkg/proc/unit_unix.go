@@ -16,8 +16,8 @@ type unit struct {
 	pgid int
 }
 
-func startInUnit(cmd *exec.Cmd) (unit, error) {
-	cmd.SysProcAttr = sysProcAttr()
+func startInUnit(cmd *exec.Cmd, parentDeath bool) (unit, error) {
+	cmd.SysProcAttr = sysProcAttr(parentDeath)
 	if err := cmd.Start(); err != nil {
 		return unit{}, err
 	}

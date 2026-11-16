@@ -41,7 +41,8 @@ type jobAccounting struct {
 	TotalTerminatedProcesses  uint32
 }
 
-func startInUnit(cmd *exec.Cmd) (unit, error) {
+// startInUnit ignores parentDeath: the job already ends with this process.
+func startInUnit(cmd *exec.Cmd, _ bool) (unit, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return unit{}, fmt.Errorf("create a job object: %w", err)

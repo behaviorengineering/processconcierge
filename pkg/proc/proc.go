@@ -135,7 +135,9 @@ func (c Config) Start(ctx context.Context) (*Process, error) {
 		if err != nil {
 			return unit{}, err
 		}
-		u, err := startInUnit(l.cmd)
+		// A reaper must outlive its parent long enough to stop its child's unit, so only a child started directly gets
+		// the parent-death signal.
+		u, err := startInUnit(l.cmd, !c.underReaper())
 		l.afterStart()
 		if err != nil {
 			l.abandon()

@@ -62,6 +62,9 @@ func TestTheReaperClearsWhatTheProgramLeftAndExitsWithItsCode(t *testing.T) {
 func TestOwnerFDIsRefusedOnWindows(t *testing.T) {
 	cmd := exec.Command(binary, "run", "--owner-fd", "3", "--", os.Args[0]) //nolint:gosec // G204: the command these tests built.
 	cmd.Env = proctest.Env(proctest.Exit4, "")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
 	if code := proctest.ExitCode(t, cmd); code != ExitUsage {
 		t.Fatalf("run --owner-fd exited %d on Windows, want %d", code, ExitUsage)
 	}
