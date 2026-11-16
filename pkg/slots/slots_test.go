@@ -41,6 +41,8 @@ func TestTakeHandsOutEachSlotOnceAndReleaseGivesItBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Windows will not delete a file still held open, so every slot is given back before the temp folder goes.
+	t.Cleanup(func() { _ = second.Release() })
 	if first.Index == second.Index {
 		t.Fatalf("both took slot %d", first.Index)
 	}
@@ -61,6 +63,7 @@ func TestTakeHandsOutEachSlotOnceAndReleaseGivesItBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = third.Release() })
 	if third.Index != first.Index {
 		t.Fatalf("took slot %d, want the released %d", third.Index, first.Index)
 	}
