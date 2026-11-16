@@ -1,0 +1,261 @@
+// Package sweep keeps a folder of the child processes a program supervises, one file for each, with the time each
+// started, so a later run can stop the ones a crash or a force-quit left running. The start time guards against a
+// pid the system has since given to another program: an entry is only acted on when the process with that pid
+// started when the entry says. A small window remains between that check and the kill; Linux pidfds and Windows
+// process handles close it, and macOS has nothing better than the check.
+package sweep
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/shirou/gopsutil/v4/process"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/behaviorengineering/processconcierge/pkg/proc"
+	"github.com/behaviorengineering/processconcierge/pkg/procerr"
+)
+
+var tracer = otel.Tracer("github.com/behaviorengineering/processconcierge/pkg/sweep")
+
+// Entry is one supervised child.
+type Entry struct {
+	// PID is the child's process id, which also leads its group.
+	PID int `json:"pid"`
+	// StartedMS is when the child started, in milliseconds since the Unix epoch, as the system reports it.
+	StartedMS int64 `json:"started_ms"`
+}
+
+// Outcome is what a sweep did with one entry.
+type Outcome string
+
+const (
+	// Stopped means the child, or something it started, was still running, and the child's group was killed.
+	Stopped Outcome = "stopped"
+	// WouldStop means a dry run found the child still running.
+	WouldStop Outcome = "would-stop"
+	// Gone means no process has that pid any more.
+	Gone Outcome = "gone"
+	// Reused means another program now has that pid, so it was left alone.
+	Reused Outcome = "reused"
+)
+
+// Result is one entry and what the sweep did with it.
+type Result struct {
+	Entry   Entry   `json:"entry"`
+	Outcome Outcome `json:"outcome"`
+}
+
+// Registry is the folder of entries. Each entry is its own file, named by pid, so several supervisors can add and
+// remove entries at once without a lock.
+type Registry struct {
+	Dir string
+}
+
+// Record adds an entry for a running child, reading its start time from the system.
+func (r Registry) Record(ctx context.Context, pid int) error {
+	const op = "sweep.Record"
+	if err := r.check(ctx, op); err != nil {
+		return err
+	}
+	started, err := startedMS(ctx, pid)
+	if err != nil {
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "read the child's start time").With("pid", pid)
+	}
+	if err := os.MkdirAll(r.Dir, 0o700); err != nil {
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "make the folder").With("dir", r.Dir)
+	}
+	data, err := json.Marshal(Entry{PID: pid, StartedMS: started})
+	if err != nil {
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "encode the entry").With("pid", pid)
+	}
+	// Written to a temporary file and renamed, so a sweep never reads half an entry.
+	tmp, err := os.CreateTemp(r.Dir, ".entry-*")
+	if err != nil {
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "create the entry").With("pid", pid)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "write the entry").With("pid", pid)
+	}
+	if err := tmp.Close(); err != nil {
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "close the entry").With("pid", pid)
+	}
+	if err := os.Rename(tmp.Name(), r.path(pid)); err != nil {
+		return procerr.Wrap(err, procerr.CodeRegistry, op, "save the entry").With("pid", pid)
+	}
+	return nil
+}
+
+// Remove drops a child's entry once it has ended. An entry already gone is not an error.
+func (r Registry) Remove(pid int) error {
+	if err := os.Remove(r.path(pid)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return procerr.Wrap(err, procerr.CodeRegistry, "sweep.Remove", "remove the entry").With("pid", pid)
+	}
+	return nil
+}
+
+// Entries lists the folder's entries, oldest pid first, and changes nothing. A missing folder holds none, and an
+// entry that cannot be read is skipped; Sweep removes those.
+func (r Registry) Entries(ctx context.Context) ([]Entry, error) {
+	entries, _, err := r.scan(ctx, "sweep.Entries")
+	return entries, err
+}
+
+// scan reads the folder: the entries it can read, oldest pid first, and the names of the files it cannot.
+func (r Registry) scan(ctx context.Context, op string) ([]Entry, []string, error) {
+	if err := r.check(ctx, op); err != nil {
+		return nil, nil, err
+	}
+	files, err := os.ReadDir(r.Dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, procerr.Wrap(err, procerr.CodeRegistry, op, "read the folder").With("dir", r.Dir)
+	}
+	var entries []Entry
+	var unreadable []string
+	for _, file := range files {
+		name := file.Name()
+		if file.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(r.Dir, name)) //nolint:gosec // G304: an entry in the registry folder the caller named.
+		if err != nil {
+			return nil, nil, procerr.Wrap(err, procerr.CodeRegistry, op, "read an entry").With("file", name)
+		}
+		var entry Entry
+		if err := json.Unmarshal(data, &entry); err != nil || entry.PID <= 1 {
+			// An entry that cannot be read names no process anyone can act on.
+			unreadable = append(unreadable, name)
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].PID < entries[j].PID })
+	return entries, unreadable, nil
+}
+
+// Sweep stops the group of every recorded child that is still running and removes its entry, and removes entries
+// that cannot be read. One entry that fails does not stop the rest: its error is joined into the one returned, beside
+// the results of every entry that was dealt with, and an entry whose group could not be killed is kept for the next
+// sweep. With dryRun it only reports what it would do, and changes nothing.
+func (r Registry) Sweep(ctx context.Context, dryRun bool) ([]Result, error) {
+	const op = "sweep.Sweep"
+	entries, unreadable, err := r.scan(ctx, op)
+	if err != nil {
+		return nil, err
+	}
+	var errs []error
+	if !dryRun {
+		errs = r.removeUnreadable(unreadable)
+	}
+	ctx, span := tracer.Start(ctx, "processconcierge.sweep")
+	defer span.End()
+	counts := map[Outcome]int{}
+	defer func() {
+		span.SetAttributes(attribute.String("sweep.dir", r.Dir), attribute.Bool("sweep.dry_run", dryRun),
+			attribute.Int("sweep.entries", len(entries)), attribute.Int("sweep.stopped", counts[Stopped]),
+			attribute.Int("sweep.would_stop", counts[WouldStop]), attribute.Int("sweep.gone", counts[Gone]),
+			attribute.Int("sweep.reused", counts[Reused]))
+	}()
+	results := make([]Result, 0, len(entries))
+	for _, entry := range entries {
+		outcome, err := r.sweepOne(ctx, entry, dryRun)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if outcome == "" {
+			continue
+		}
+		counts[outcome]++
+		results = append(results, Result{Entry: entry, Outcome: outcome})
+	}
+	return results, errors.Join(errs...)
+}
+
+// sweepOne deals with one entry and says what it did. An entry whose group could not be killed has no outcome and
+// stays, so the next sweep tries again.
+func (r Registry) sweepOne(ctx context.Context, entry Entry, dryRun bool) (Outcome, error) {
+	outcome := r.judge(ctx, entry)
+	if outcome == Stopped && dryRun {
+		return WouldStop, nil
+	}
+	if outcome == Stopped {
+		if err := proc.KillGroup(entry.PID); err != nil {
+			return "", procerr.Wrap(err, procerr.CodeSignal, "sweep.Sweep", "kill a left-over group").With("pid", entry.PID)
+		}
+	}
+	if dryRun {
+		return outcome, nil
+	}
+	return outcome, r.Remove(entry.PID)
+}
+
+// removeUnreadable removes the entries no one can act on, and returns what it could not remove.
+func (r Registry) removeUnreadable(names []string) []error {
+	var errs []error
+	for _, name := range names {
+		if err := os.Remove(filepath.Join(r.Dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, procerr.Wrap(err, procerr.CodeRegistry, "sweep.Sweep", "remove an unreadable entry").With("file", name))
+		}
+	}
+	return errs
+}
+
+// judge says whether an entry's child, or what it started, is still running, or whether the child is gone or its pid
+// now belongs to another program.
+//
+// A child can be gone while its group still holds what it started: on Linux the parent-death signal ends only the
+// child, not its descendants. Such a group is stopped too. A group id is never given to a new process while the group
+// has members, so a group still alive under a gone leader is the child's own, unless the whole group emptied, the pid
+// went to another program that led a group of its own, and that program ended while its group lived on; that is
+// left as a known, unlikely case.
+func (r Registry) judge(ctx context.Context, entry Entry) Outcome {
+	started, err := startedMS(ctx, entry.PID)
+	switch {
+	case err != nil && proc.GroupAlive(entry.PID):
+		return Stopped
+	case err != nil:
+		return Gone
+	case started != entry.StartedMS:
+		return Reused
+	default:
+		return Stopped
+	}
+}
+
+func (r Registry) check(ctx context.Context, op string) error {
+	if ctx == nil {
+		return procerr.New(procerr.CodeInvalid, op, "context is required")
+	}
+	if strings.TrimSpace(r.Dir) == "" {
+		return procerr.New(procerr.CodeInvalid, op, "no registry folder")
+	}
+	return nil
+}
+
+func (r Registry) path(pid int) string {
+	return filepath.Join(r.Dir, strconv.Itoa(pid)+".json")
+}
+
+func startedMS(ctx context.Context, pid int) (int64, error) {
+	if pid <= 0 || pid > 1<<31-1 {
+		return 0, errors.New("pid out of range")
+	}
+	p, err := process.NewProcessWithContext(ctx, int32(pid)) //nolint:gosec // G115: range checked above.
+	if err != nil {
+		return 0, err
+	}
+	return p.CreateTimeWithContext(ctx)
+}

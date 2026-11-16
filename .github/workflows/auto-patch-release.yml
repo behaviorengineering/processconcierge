@@ -1,0 +1,90 @@
+name: Auto patch release
+
+# Releases only a commit CI passed: it runs when the CI workflow finishes on main, and tags that run's commit only if
+# CI succeeded. A manual run (workflow_dispatch) releases the tip of main with the chosen bump.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver bump level
+        required: false
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-patch-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      new_tag: ${{ steps.decide.outputs.new_tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Read the released commit's message
+        id: head
+        run: |
+          set -euo pipefail
+          {
+            echo "message<<PROCESSCONCIERGE_EOF"
+            git log -1 --format=%B HEAD
+            echo "PROCESSCONCIERGE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to tag
+        id: decide
+        env:
+          # A run after CI counts as a push; only workflow_dispatch is a manual bump.
+          EVENT_NAME: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || 'push' }}
+          MANUAL_BUMP: ${{ github.event.inputs.bump }}
+          HEAD_MSG: ${{ steps.head.outputs.message }}
+          AUTO_PATCH_EXTRA_HARNESS_PATHS: ""
+        run: bash scripts/auto-patch-decide.sh
+
+      - name: Skip notice
+        if: steps.decide.outputs.skip == 'true'
+        env:
+          REASON: ${{ steps.decide.outputs.reason }}
+        run: echo "Skipping auto release - ${REASON}"
+
+      - uses: actions/setup-go@v6
+        if: steps.decide.outputs.skip != 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Create and push tag
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          NEW_TAG: ${{ steps.decide.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
+          git push origin "refs/tags/${NEW_TAG}"
+
+      - uses: goreleaser/goreleaser-action@v6
+        if: steps.decide.outputs.skip != 'true'
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
