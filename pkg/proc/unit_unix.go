@@ -45,6 +45,12 @@ func (u unit) empty() bool {
 	return errors.Is(syscall.Kill(-u.pgid, 0), syscall.ESRCH)
 }
 
+// GroupAlive reports whether anyone is still in the group pgid led, which can hold a child's descendants after the
+// child itself is gone.
+func GroupAlive(pgid int) bool {
+	return pgid > 1 && !errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH)
+}
+
 // KillGroup kills every process in the group pgid leads. A group with nobody left in it is not an error.
 func KillGroup(pgid int) error {
 	if pgid <= 1 {

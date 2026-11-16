@@ -167,18 +167,19 @@ func TestTheReaperRecordsTheProgramWhileItRunsAndRemovesItAfter(t *testing.T) {
 func TestSweepStopsWhatACrashedReaperLeftAndReportsIt(t *testing.T) {
 	dir := t.TempDir()
 	registry := filepath.Join(dir, "registry")
-	ready := filepath.Join(dir, "ready")
-	cmd, _ := startReaper(t, "echo $$ > "+ready+"; sleep 60", "--registry", registry)
-	pid := readPid(t, ready)
+	file := filepath.Join(dir, "grandchild")
+	cmd, _ := startReaper(t, "sleep 60 & echo $! > "+file+"; wait", "--registry", registry)
+	grandchild := readPid(t, file)
 	waitFor(t, "no registry entry for the program", func() bool {
 		entries, _ := os.ReadDir(registry)
 		return len(entries) == 1
 	})
-	// A reaper killed outright leaves its program running and its entry behind, as a force-quit would.
+	// A reaper killed outright leaves its entry behind, as a force-quit would. On macOS its program keeps running;
+	// on Linux the parent-death signal ends the program, but not the grandchild, which stays in the program's group.
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
-	if !alive(pid) {
-		t.Fatal("the program died with the reaper, so this test proves nothing")
+	if !alive(grandchild) {
+		t.Fatal("the grandchild died with the reaper, so this test proves nothing")
 	}
 
 	var out bytes.Buffer
@@ -186,10 +187,10 @@ func TestSweepStopsWhatACrashedReaperLeftAndReportsIt(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("sweep exited %d: %s", code, out.String())
 	}
-	if !strings.Contains(out.String(), "pid "+strconv.Itoa(pid)) || !strings.Contains(out.String(), "Outcome:  stopped") {
+	if !strings.Contains(out.String(), "Outcome:  stopped") {
 		t.Fatalf("sweep printed:\n%s", out.String())
 	}
-	waitFor(t, "the left-over program is still running", func() bool { return !alive(pid) })
+	waitFor(t, "the left-over grandchild is still running", func() bool { return !alive(grandchild) })
 }
 
 func TestTheGuideVersionAndAnUnknownCommand(t *testing.T) {

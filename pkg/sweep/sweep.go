@@ -34,7 +34,7 @@ type Entry struct {
 type Outcome string
 
 const (
-	// Stopped means the child was still running, and its group was killed.
+	// Stopped means the child, or something it started, was still running, and the child's group was killed.
 	Stopped Outcome = "stopped"
 	// WouldStop means a dry run found the child still running.
 	WouldStop Outcome = "would-stop"
@@ -164,10 +164,19 @@ func (r Registry) Sweep(ctx context.Context, dryRun bool) ([]Result, error) {
 	return results, nil
 }
 
-// judge says whether an entry's child is still running, gone, or replaced by another program with the same pid.
+// judge says whether an entry's child, or what it started, is still running, or whether the child is gone or its pid
+// now belongs to another program.
+//
+// A child can be gone while its group still holds what it started: on Linux the parent-death signal ends only the
+// child, not its descendants. Such a group is stopped too. A group id is never given to a new process while the group
+// has members, so a group still alive under a gone leader is the child's own, unless the whole group emptied, the pid
+// went to another program that led a group of its own, and that program ended while its group lived on; that is
+// left as a known, unlikely case.
 func (r Registry) judge(ctx context.Context, entry Entry) Outcome {
 	started, err := startedMS(ctx, entry.PID)
 	switch {
+	case err != nil && proc.GroupAlive(entry.PID):
+		return Stopped
 	case err != nil:
 		return Gone
 	case started != entry.StartedMS:

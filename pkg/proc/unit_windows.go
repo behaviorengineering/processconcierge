@@ -23,6 +23,11 @@ func (unit) kill() error { return errNoJobObjects }
 
 func (unit) empty() bool { return true }
 
+// GroupAlive is not supported on Windows yet, so it reports no group.
+func GroupAlive(int) bool {
+	return false
+}
+
 // KillGroup is not supported on Windows yet.
 func KillGroup(int) error {
 	return errNoJobObjects

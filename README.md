@@ -53,7 +53,7 @@ At start-up, before starting any children, the parent runs:
 processconcierge sweep --registry "$registryDir"
 ```
 
-It kills the group of every recorded program that is still running, and passes over any entry whose pid now belongs to another program, which it can tell from the start time the entry records. `--dry-run` reports the same and changes nothing; `--json` prints the results for a program to read.
+It kills the group of every recorded program that is still running, or whose group still holds something the program started, as on Linux, where the parent-death signal ends the program but not its descendants. It passes over any entry whose pid now belongs to another program, which it can tell from the start time the entry records. `--dry-run` reports the same and changes nothing; `--json` prints the results for a program to read.
 
 ## From Go
 

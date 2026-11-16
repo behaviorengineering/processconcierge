@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -147,5 +148,45 @@ func write(t *testing.T, reg Registry, entry Entry) {
 	}
 	if err := os.WriteFile(reg.path(entry.PID), data, 0o600); err != nil && !errors.Is(err, os.ErrExist) {
 		t.Fatal(err)
+	}
+}
+
+func TestSweepStopsAGroupThatOutlivedItsLeader(t *testing.T) {
+	ctx := context.Background()
+	reg := Registry{Dir: t.TempDir()}
+	file := filepath.Join(t.TempDir(), "leftover")
+	p, err := proc.Config{Path: "/bin/sh", Args: []string{"-c", "trap '' HUP; sleep 60 > /dev/null 2>&1 & echo $! > " + file}}.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Kill() })
+	if err := reg.Record(ctx, p.Pid()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(file) //nolint:gosec // G304: a file in the test's own temp folder.
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leftover int
+	if _, err := fmt.Sscan(string(data), &leftover); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := reg.Sweep(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Outcome != Stopped {
+		t.Fatalf("results = %+v", results)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(leftover, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the group's left-over process is still running")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
